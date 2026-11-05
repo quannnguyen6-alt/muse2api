@@ -367,7 +367,9 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None,
+                     reference_images: list[str] | None = None,
+                     full_response: bool = False):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -418,14 +420,21 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         if stop_event.is_set():
                             return
                         engine.start()
-                        for chunk in engine.chat_stream(
-                            cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
-                        ):
+                        chat_options = {"account_id": cur_id, "stop_event": stop_event,
+                                        "reference_images": reference_images}
+                        if full_response:
+                            text = engine.chat(cur_cookies, prompt, cur_exp, timeout,
+                                               **chat_options)
                             yielded = True
-                            q.put(("data", chunk))
-                            if stop_event.is_set():
-                                return
+                            q.put(("data", text))
+                        else:
+                            for chunk in engine.chat_stream(
+                                cur_cookies, prompt, cur_exp, timeout, **chat_options
+                            ):
+                                yielded = True
+                                q.put(("data", chunk))
+                                if stop_event.is_set():
+                                    return
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
@@ -754,6 +763,18 @@ def _content_text(content) -> str:
                 parts.append(item)
         return "\n".join(p for p in parts if p)
     return str(content)
+
+
+def chat_image_references(messages: list[ChatMessage]) -> list[str]:
+    """Collect OpenAI image_url parts in message order, using reference limits."""
+    images = []
+    for message in messages:
+        if not isinstance(message.content, list):
+            continue
+        for part in message.content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                images.append(part.get("image_url"))
+    return _reference_list(images, [], "messages.image_url")
 
 
 def build_chat_prompt(messages: list[ChatMessage]) -> str:
@@ -1571,6 +1592,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     对话与生图/生视频共用同一个浏览器实例，靠 `GEN_LOCK` 串行。
     """
+    reference_images = chat_image_references(req.messages)
     prompt = build_chat_prompt(req.messages) or (req.prompt or "").strip()
     if not prompt:
         raise HTTPException(400, "messages 为空")
@@ -1610,7 +1632,8 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
+                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout,
+                                              account_id=acc_id, reference_images=reference_images)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1672,7 +1695,8 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id,
+                                        reference_images=reference_images, full_response=True))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1808,7 +1832,8 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id,
+                                        full_response=True))
 
     try:
         text = await asyncio.to_thread(run)

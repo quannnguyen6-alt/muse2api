@@ -1014,10 +1014,17 @@ class MuseEngine:
     # 检查「文字真的进了输入框 + Send 按钮真的被渲染出来」。
     # 两个条件缺一不可：Send 按钮只有 React state 里有文字才会渲染 ——
     # 它在，就说明 React 真的收到了输入（不是 DOM value 被改了而已）。
+    _SEND_BUTTON_JS = (
+        "[...document.querySelectorAll('button,[role=button]')]"
+        ".filter(function(x){return x.offsetParent!==null;})"
+        ".find(function(x){return /^(?:send(?: message)?|发送(?:消息)?)(?:\\s*\\((?:enter|return)\\))?$/i"
+        ".test((x.getAttribute('aria-label')||'').trim())"
+        "||/^(?:hatch-composer-(?:send|submit)-button|send-button|send-message-button)$/i"
+        ".test(x.getAttribute('data-testid')||'');})"
+    )
     _SEND_STATE_JS = (
         "(function(){var ta=document.querySelector('textarea');"
-        "var b=[...document.querySelectorAll('button,[role=button]')]"
-        ".find(function(x){return /send/i.test(x.getAttribute('aria-label')||'');});"
+        "var b=" + _SEND_BUTTON_JS + ";"
         "return JSON.stringify({v:ta?ta.value:'',btn:b?(b.disabled?2:1):0});})()"
     )
 
@@ -1070,11 +1077,7 @@ class MuseEngine:
         t_deadline = time.time() + 3.0
         while time.time() < t_deadline:
             res = self.page.js(
-                "(function(){var b=[...document.querySelectorAll('button,[role=button]')]"
-                ".filter(function(x){return x.offsetParent!==null;})"
-                ".find(function(x){return /发送|send/i.test(x.getAttribute('aria-label')||'')"
-                "||/发送|send/i.test(x.getAttribute('data-testid')||'')"
-                "||/send/i.test(x.innerText||'');});"
+                "(function(){var b=" + self._SEND_BUTTON_JS + ";"
                 "if(!b)return 'no-button';"
                 "if(b.disabled)return 'disabled';"
                 "b.click();return 'clicked';})()")
@@ -1084,9 +1087,10 @@ class MuseEngine:
             time.sleep(0.08)
 
         if clicked != "clicked":
-            # 兜底：Ctrl+Enter 或普通 Enter
-            for combo in ({"modifiers": 1}, {}):
-                for t in ("keyDown", "char", "keyUp"):
+            # Plain Enter first; CDP's Control modifier is 2 (1 means Alt).
+            self.page.js("(document.querySelector('textarea')||{}).focus?.()")
+            for combo in ({}, {"modifiers": 2}):
+                for t in ("rawKeyDown", "char", "keyUp"):
                     params = {"type": t, "key": "Enter", "code": "Enter",
                               "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
                               "modifiers": combo.get("modifiers", 0)}
@@ -1432,17 +1436,30 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
+                    stop_event=None, reference_images: list[str] | None = None):
         """发一条消息，流式 yield 增量文本。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
         self.reset_thread(for_chat=True)
+        upload = self._attach_images(reference_images) if reference_images else None
+        if not reference_images:
+            self._clear_attachments()
+        try:
+            yield from self._stream_chat_reply(prompt, timeout, stop_event,
+                                               has_images=bool(reference_images))
+        finally:
+            if upload:
+                shutil.rmtree(upload["dir"], ignore_errors=True)
+
+    def _stream_chat_reply(self, prompt: str, timeout: int, stop_event=None,
+                           has_images: bool = False):
+        """Poll one submitted reply; keep the emitted length across DOM rerenders."""
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
 
         t_sent = time.time()
         deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + 40.0)
+        first_token_deadline = min(deadline, t_sent + (90.0 if has_images else 40.0))
         sent, last, stable = "", None, 0
         got_first = False
 
@@ -1453,7 +1470,7 @@ class MuseEngine:
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
+                if not has_images and time.time() - t_sent > 14.0:
                     try:
                         tail = self.page.js("document.body.innerText.slice(-500)") or ""
                     except Exception:
@@ -1462,7 +1479,7 @@ class MuseEngine:
                         raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
                 continue
 
-            delta = cur[len(sent):] if cur.startswith(sent) else cur
+            delta = cur[len(sent):] if len(cur) > len(sent) else ""
             if delta:
                 sent = cur
                 yield delta
@@ -1483,7 +1500,7 @@ class MuseEngine:
                 continue
 
             if cur != last:
-                delta = cur[len(sent):] if cur.startswith(sent) else cur
+                delta = cur[len(sent):] if len(cur) > len(sent) else ""
                 if delta:
                     sent = cur
                     yield delta
@@ -1500,12 +1517,13 @@ class MuseEngine:
         raise MuseGenerationError("等待助手回复超时")
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
-             timeout: int | None = None, account_id: str | None = None) -> str:
+             timeout: int | None = None, account_id: str | None = None,
+             reference_images: list[str] | None = None, stop_event=None) -> str:
         """发一条消息，返回完整回复文本（非流式）。"""
-        out = ""
-        for chunk in self.chat_stream(cookies, prompt, expires, timeout, account_id=account_id):
-            out += chunk
-        return out
+        for _ in self.chat_stream(cookies, prompt, expires, timeout, account_id=account_id,
+                                  reference_images=reference_images, stop_event=stop_event):
+            pass
+        return self._agent_text()
 
     def extract_bytes(self, src: str, expect: str = "image", retries: int = 4):
         last = "未知"
