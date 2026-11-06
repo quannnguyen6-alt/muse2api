@@ -2821,8 +2821,26 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     return await asyncio.to_thread(_do_push)
 
 
+def _restore_bootstrap_account() -> None:
+    """Seed an empty account store from the deployment environment."""
+    raw = os.environ.pop("MUSE2API_BOOTSTRAP_ACCOUNT", "")
+    if not raw or store.accounts:
+        return
+    try:
+        account = AccountRequest.model_validate_json(raw)
+    except ValueError:
+        log.warning("MUSE2API_BOOTSTRAP_ACCOUNT must contain a valid account JSON object")
+        return
+    if any(not account.cookies.get(name) for name in ESSENTIAL_COOKIES):
+        log.warning("MUSE2API_BOOTSTRAP_ACCOUNT is missing a required Muse cookie")
+        return
+    store.add_account(account.cookies, account.label, cookies_exp=account.expires)
+    log.info("Restored one Muse account from MUSE2API_BOOTSTRAP_ACCOUNT")
+
+
 @app.on_event("startup")
 async def _startup():
+    _restore_bootstrap_account()
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
             store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
