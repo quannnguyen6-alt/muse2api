@@ -1459,7 +1459,7 @@ class MuseEngine:
 
         t_sent = time.time()
         deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + (90.0 if has_images else 40.0))
+        first_token_deadline = min(deadline, t_sent + (150.0 if has_images else 40.0))
         sent, last, stable = "", None, 0
         got_first = False
 
